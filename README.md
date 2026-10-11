@@ -7,6 +7,9 @@ HA **On/Off Output (0x0002)** gồm các cluster Basic, Identify, Groups, Scenes
 Dùng được với Zigbee2MQTT, ZHA (Home Assistant), deCONZ/Phoscon, SmartThings, Hue Bridge... và
 mọi coordinator Zigbee 3.0.
 
+> Repo còn có project **cảm biến hiện diện Zigbee dùng radar LD2410** trong thư mục
+> [`ld2410_presence/`](ld2410_presence/README.md).
+
 ## Phần cứng
 
 Mặc định cho **ESP32-H2-MINI-1 / ESP32-H2-DevKitM-1** (flash 4 MB).

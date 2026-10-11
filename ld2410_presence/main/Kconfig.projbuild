@@ -1,0 +1,62 @@
+menu "LD2410 Presence Sensor Configuration"
+
+    # ESP32-H2 exposes GPIO0-5, GPIO8-14 and GPIO22-27.
+
+    config LD2410_UART_TX_GPIO
+        int "ESP32-H2 TX GPIO (to LD2410 RX)"
+        range 0 27
+        default 3
+        help
+            ESP32-H2 UART TX, wired to the RX pin of the LD2410.
+            GPIO3 is a strapping pin; it is only sampled at reset and the
+            LD2410 RX input does not drive it, so it is safe to use.
+
+    config LD2410_UART_RX_GPIO
+        int "ESP32-H2 RX GPIO (from LD2410 TX)"
+        range 0 27
+        default 4
+        help
+            ESP32-H2 UART RX, wired to the TX pin of the LD2410.
+
+    config LD2410_BAUD_RATE
+        int "LD2410 UART baud rate"
+        default 256000
+        help
+            Factory default of the LD2410/LD2410B/LD2410C is 256000 baud.
+
+    config LD2410_APPLY_CONFIG
+        bool "Write gate / no-one duration settings to the radar at boot"
+        default y
+        help
+            If enabled, the firmware sends the "max distance gate & no-one
+            duration" command (0x0060) at every boot. Disable to keep the
+            settings made with the HLKRadarTool app.
+
+    config LD2410_MAX_GATE
+        int "Max detection gate (moving and stationary, 1 gate = 0.75 m)"
+        range 2 8
+        default 8
+        depends on LD2410_APPLY_CONFIG
+
+    config LD2410_NO_ONE_DURATION
+        int "No-one duration (seconds before reporting unoccupied)"
+        range 0 65535
+        default 10
+        depends on LD2410_APPLY_CONFIG
+
+    config BUTTON_GPIO
+        int "Button GPIO number (-1 to disable)"
+        range -1 27
+        default 9
+        help
+            Push button to GND (GPIO9 = on-board BOOT button).
+            Hold >= RESET_HOLD_SECONDS to leave the network and factory
+            reset the Zigbee stack.
+
+    config RESET_HOLD_SECONDS
+        int "Hold time for factory reset (seconds)"
+        range 3 30
+        default 5
+        depends on BUTTON_GPIO >= 0
+
+endmenu
