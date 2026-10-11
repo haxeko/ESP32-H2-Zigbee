@@ -92,10 +92,23 @@ I zb_presence: state 2, moving 0 cm (0), stationary 135 cm (47), detect 135 cm
 > (interview), nên phải: xoá thiết bị trong Z2M → giữ nút BOOT ≥ 5 s (hoặc `erase-flash` khi nạp) để
 > factory reset → *Permit join* và ghép lại. Sau khi ghép lại sẽ thấy đủ 3 entity.
 
+## Chạy lâu dài / chống treo
+
+- **Task watchdog**: task Zigbee và task LD2410 được giám sát; nếu một task ngừng chạy quá **30 s**
+  (stack Zigbee kẹt, hết buffer, task radar bị chặn...) thiết bị **tự khởi động lại** và vào lại mạng.
+  (Mặc định của ESP-IDF chỉ in cảnh báo, không reset, nên trước đây thiết bị đứng luôn.)
+- **Tự khôi phục radar**: quá **30 s** không nhận được frame nào, firmware gửi lệnh restart (0x00A3) cho
+  LD2410 và thử lại mỗi 30 s cho tới khi radar gửi dữ liệu lại.
+- **Log chẩn đoán** để tìm nguyên nhân:
+  - lúc khởi động: `Reset reason: ...`. `TASK WATCHDOG` = một task bị kẹt, `PANIC` = crash,
+    `BROWNOUT` = sụt nguồn;
+  - mỗi 10 phút: `Uptime ... min, free heap ... B (min ... B), Zigbee stack free ... B`.
+    Heap giảm dần theo thời gian = rò rỉ bộ nhớ.
+
 ## Cấu trúc
 
 ```
 main/app_main.c        stack Zigbee, cluster Occupancy Sensing, báo cáo trạng thái, nút reset
-main/ld2410.c/.h       driver UART LD2410: phân tích frame dữ liệu, lệnh cấu hình 0x0060
+main/ld2410.c/.h       driver UART LD2410: phân tích frame dữ liệu, lệnh cấu hình 0x0060, tự restart radar
 main/Kconfig.projbuild chân UART, baud, cấu hình radar, nút nhấn
 ```

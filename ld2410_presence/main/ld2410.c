@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "sdkconfig.h"
 
 #include "ld2410.h"
@@ -23,6 +24,7 @@ static const char *TAG = "ld2410";
 #define LD2410_UART         UART_NUM_1
 #define UART_RX_BUF_SIZE    1024
 #define FRAME_MAX_LEN       64
+#define RECOVERY_TIMEOUT_MS 30000   /* no data frame for this long = restart the radar */
 
 static const uint8_t DATA_HEADER[4] = { 0xF4, 0xF3, 0xF2, 0xF1 };
 static const uint8_t DATA_FOOTER[4] = { 0xF8, 0xF7, 0xF6, 0xF5 };
@@ -33,7 +35,6 @@ static ld2410_report_cb_t s_cb;
 
 /* ---------- commands ---------- */
 
-#if CONFIG_LD2410_APPLY_CONFIG
 static void send_command(uint16_t cmd, const uint8_t *value, uint16_t value_len)
 {
     uint8_t frame[FRAME_MAX_LEN];
@@ -56,6 +57,10 @@ static void send_command(uint16_t cmd, const uint8_t *value, uint16_t value_len)
     vTaskDelay(pdMS_TO_TICKS(150)); /* ACK is ignored by the data-frame parser */
 }
 
+static const uint8_t ENABLE_CONFIG_VALUE[2] = { 0x01, 0x00 };
+
+#if CONFIG_LD2410_APPLY_CONFIG
+
 static void put_param(uint8_t *p, uint16_t word, uint32_t value)
 {
     p[0] = word & 0xFF;
@@ -68,16 +73,15 @@ static void put_param(uint8_t *p, uint16_t word, uint32_t value)
 
 static void apply_config(void)
 {
-    const uint8_t enable_value[2] = { 0x01, 0x00 };
     uint8_t params[18];
 
     put_param(&params[0],  0x0000, CONFIG_LD2410_MAX_GATE);         /* max moving gate */
     put_param(&params[6],  0x0001, CONFIG_LD2410_MAX_GATE);         /* max stationary gate */
     put_param(&params[12], 0x0002, CONFIG_LD2410_NO_ONE_DURATION);  /* no-one duration (s) */
 
-    send_command(0x00FF, enable_value, sizeof(enable_value)); /* enable configuration */
-    send_command(0x0060, params, sizeof(params));             /* max gate & no-one duration */
-    send_command(0x00FE, NULL, 0);                            /* end configuration */
+    send_command(0x00FF, ENABLE_CONFIG_VALUE, sizeof(ENABLE_CONFIG_VALUE)); /* enable configuration */
+    send_command(0x0060, params, sizeof(params));                           /* max gate & no-one duration */
+    send_command(0x00FE, NULL, 0);                                          /* end configuration */
 
     ESP_LOGI(TAG, "Configured: max gate %d (%.2f m), no-one duration %d s",
              CONFIG_LD2410_MAX_GATE, CONFIG_LD2410_MAX_GATE * 0.75, CONFIG_LD2410_NO_ONE_DURATION);
@@ -89,6 +93,7 @@ static void apply_config(void)
 static uint8_t s_frame[FRAME_MAX_LEN];
 static size_t s_idx;
 static uint16_t s_len;
+static TickType_t s_last_frame_tick;
 
 static void handle_frame(const uint8_t *payload, uint16_t len)
 {
@@ -104,6 +109,7 @@ static void handle_frame(const uint8_t *payload, uint16_t len)
         .stationary_energy      = payload[8],
         .detection_distance_cm  = payload[9] | (payload[10] << 8),
     };
+    s_last_frame_tick = xTaskGetTickCount();
     if (s_cb) {
         s_cb(&r);
     }
@@ -138,20 +144,43 @@ static void parse_byte(uint8_t b)
     }
 }
 
+/* The LD2410 occasionally stops sending data frames until it is restarted */
+static void restart_radar(void)
+{
+    ESP_LOGW(TAG, "No data frame for %d s - sending restart command to the LD2410",
+             RECOVERY_TIMEOUT_MS / 1000);
+    s_idx = 0;
+    uart_flush_input(LD2410_UART);
+    send_command(0x00FF, ENABLE_CONFIG_VALUE, sizeof(ENABLE_CONFIG_VALUE)); /* enable configuration */
+    send_command(0x00A3, NULL, 0);                                          /* restart module */
+    uart_flush_input(LD2410_UART);
+}
+
 static void ld2410_task(void *arg)
 {
     uint8_t buf[128];
+
+    /* Reboot via the task watchdog if this task ever gets stuck */
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "Task watchdog not available for the LD2410 task");
+    }
 
 #if CONFIG_LD2410_APPLY_CONFIG
     vTaskDelay(pdMS_TO_TICKS(500)); /* let the radar finish booting */
     apply_config();
     uart_flush_input(LD2410_UART);
 #endif
+    s_last_frame_tick = xTaskGetTickCount();
 
     while (true) {
+        esp_task_wdt_reset();
         int n = uart_read_bytes(LD2410_UART, buf, sizeof(buf), pdMS_TO_TICKS(100));
         for (int i = 0; i < n; i++) {
             parse_byte(buf[i]);
+        }
+        if (xTaskGetTickCount() - s_last_frame_tick > pdMS_TO_TICKS(RECOVERY_TIMEOUT_MS)) {
+            restart_radar();
+            s_last_frame_tick = xTaskGetTickCount(); /* retry every RECOVERY_TIMEOUT_MS */
         }
     }
 }
@@ -176,5 +205,5 @@ esp_err_t ld2410_start(ld2410_report_cb_t cb)
     ESP_LOGI(TAG, "UART%d @ %d baud, TX GPIO%d -> LD2410 RX, RX GPIO%d <- LD2410 TX",
              LD2410_UART, CONFIG_LD2410_BAUD_RATE, CONFIG_LD2410_UART_TX_GPIO, CONFIG_LD2410_UART_RX_GPIO);
 
-    return xTaskCreate(ld2410_task, "ld2410", 3072, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_FAIL;
+    return xTaskCreate(ld2410_task, "ld2410", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_FAIL;
 }

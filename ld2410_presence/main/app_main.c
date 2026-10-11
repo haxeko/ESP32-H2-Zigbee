@@ -17,6 +17,9 @@
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
 
@@ -52,6 +55,9 @@ static const char *TAG = "zb_presence";
 #define RADAR_MONITOR_PERIOD_MS         1000
 #define DISTANCE_REPORT_STEP_CM         10
 #define RADAR_HEARTBEAT_PERIODS         60      /* re-report online/distance every 60 s */
+#define HEALTH_LOG_PERIODS              600     /* log uptime / free heap every 10 min */
+#define WATCHDOG_TIMEOUT_MS             30000   /* reboot if the Zigbee or LD2410 task stalls */
+#define ZB_LOCK_TIMEOUT_MS              1000
 
 #define ESP_ZB_ZR_CONFIG()                                  \
     {                                                       \
@@ -120,11 +126,24 @@ static void report_occupancy(uint8_t occupancy)
                    ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID, &occupancy);
 }
 
-/* Runs every second in the Zigbee task: radar online state and target distance */
+/* Runs every second in the Zigbee task: radar online state and target distance.
+ * Also feeds the task watchdog: if the Zigbee stack stops running scheduler
+ * callbacks (stalled main loop, exhausted buffers), the device reboots. */
 static void radar_monitor_cb(uint8_t param)
 {
     static int periods;
+    static int health_periods;
     static int logged_online = -1;
+
+    esp_task_wdt_reset();
+
+    if (++health_periods >= HEALTH_LOG_PERIODS) {
+        health_periods = 0;
+        ESP_LOGI(TAG, "Uptime %lld min, free heap %lu B (min %lu B), Zigbee stack free %u B",
+                 esp_timer_get_time() / 60000000LL, (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
 
     bool online = s_frame_received &&
                   (xTaskGetTickCount() - s_last_frame_tick) < pdMS_TO_TICKS(RADAR_TIMEOUT_MS);
@@ -190,11 +209,14 @@ static void on_radar_report(const ld2410_report_t *r)
     if (occupied == s_occupied || !s_zb_started) {
         return;
     }
+    /* Never block the radar task forever on the Zigbee lock; retried on the next frame */
+    if (!esp_zb_lock_acquire(pdMS_TO_TICKS(ZB_LOCK_TIMEOUT_MS))) {
+        ESP_LOGW(TAG, "Zigbee lock busy, occupancy report postponed");
+        return;
+    }
     s_occupied = occupied;
     ESP_LOGI(TAG, "%s (state %d, distance %u cm)", occupied ? "OCCUPIED" : "UNOCCUPIED",
              r->state, r->detection_distance_cm);
-
-    esp_zb_lock_acquire(portMAX_DELAY);
     report_occupancy(occupied ? 1 : 0);
     esp_zb_lock_release();
 }
@@ -385,7 +407,43 @@ static void esp_zb_task(void *pvParameters)
     ESP_ERROR_CHECK(esp_zb_start(false));
     s_zb_started = true;
     esp_zb_scheduler_alarm(radar_monitor_cb, 0, RADAR_MONITOR_PERIOD_MS);
+    /* Fed by radar_monitor_cb, which runs inside the stack main loop */
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
     esp_zb_stack_main_loop();
+}
+
+/* The default task watchdog only watches the idle task and does not reset the
+ * chip. Make it reboot the device when a subscribed task stops feeding it, so
+ * a stalled Zigbee stack or radar task recovers by itself instead of hanging. */
+static void watchdog_init(void)
+{
+    esp_task_wdt_config_t cfg = {
+        .timeout_ms = WATCHDOG_TIMEOUT_MS,
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+        .idle_core_mask = 1 << 0,
+#endif
+        .trigger_panic = true,
+    };
+    esp_err_t err = esp_task_wdt_reconfigure(&cfg);
+    if (err == ESP_ERR_INVALID_STATE) {
+        err = esp_task_wdt_init(&cfg); /* CONFIG_ESP_TASK_WDT_INIT disabled */
+    }
+    ESP_ERROR_CHECK(err);
+}
+
+static const char *reset_reason_str(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "PANIC / exception";
+    case ESP_RST_INT_WDT:   return "INTERRUPT WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "TASK WATCHDOG (a task was stuck)";
+    case ESP_RST_WDT:       return "WATCHDOG";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (power supply dropped)";
+    case ESP_RST_EXT:       return "external pin";
+    default:                return "other";
+    }
 }
 
 void app_main(void)
@@ -394,6 +452,10 @@ void app_main(void)
         .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
         .host_config = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
     };
+
+    esp_reset_reason_t reason = esp_reset_reason();
+    ESP_LOGI(TAG, "Reset reason: %s (%d)", reset_reason_str(reason), reason);
+    watchdog_init();
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -406,6 +468,6 @@ void app_main(void)
 #if CONFIG_BUTTON_GPIO >= 0
     button_init();
 #endif
-    xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+    xTaskCreate(esp_zb_task, "Zigbee_main", 6144, NULL, 5, NULL);
     ESP_ERROR_CHECK(ld2410_start(on_radar_report));
 }
