@@ -1,0 +1,58 @@
+menu "Zigbee Relay Configuration"
+
+    # ESP32-H2 exposes GPIO0-5, GPIO8-14 and GPIO22-27.
+    # Avoid strapping pins GPIO2/3/8/9/25, GPIO26/27 (USB D-/D+)
+    # and GPIO23/24 (UART0 console) for the relay.
+
+    config RELAY_GPIO
+        int "Relay GPIO number"
+        range 0 27
+        default 12
+        help
+            GPIO that drives the relay (relay module IN pin, or the base of
+            the transistor/optocoupler).
+
+    config RELAY_ACTIVE_HIGH
+        bool "Relay is active-high"
+        default y
+        help
+            Enable if writing 1 to the GPIO energises the relay.
+            Disable for active-low ("low level trigger") relay modules.
+
+    config BUTTON_GPIO
+        int "Button GPIO number (-1 to disable)"
+        range -1 27
+        default 9
+        help
+            Local push button (to GND, internal pull-up is enabled).
+            GPIO9 is the on-board BOOT button. Short press toggles the
+            relay, hold >= RESET_HOLD_SECONDS leaves the network and
+            performs a Zigbee factory reset. Set to -1 to disable.
+
+    config RESET_HOLD_SECONDS
+        int "Hold time for factory reset (seconds)"
+        range 3 30
+        default 5
+        depends on BUTTON_GPIO >= 0
+
+    config STATUS_LED_GPIO
+        int "Status LED GPIO number (-1 to disable)"
+        range -1 27
+        default -1
+        help
+            Simple (non-addressable) LED that mirrors the relay state.
+            ESP32-H2-DevKitM-1 has an addressable RGB LED on GPIO8, so the
+            default is disabled.
+
+    config STATUS_LED_ACTIVE_LOW
+        bool "Status LED is active-low"
+        default n
+        depends on STATUS_LED_GPIO >= 0
+
+    config RESTORE_RELAY_STATE
+        bool "Restore relay state after power loss"
+        default y
+        help
+            Save the relay state in NVS and restore it at boot.
+
+endmenu
