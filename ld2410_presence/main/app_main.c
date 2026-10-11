@@ -1,11 +1,16 @@
 /*
  * Zigbee 3.0 presence sensor: ESP32-H2 + HLK-LD2410 24 GHz mmWave radar.
  *
- * Router device with one HA endpoint exposing Basic, Identify and
- * Occupancy Sensing (0x0406) server clusters. The Occupancy attribute
- * follows the radar target state (moving and/or stationary target = occupied)
- * and is reported to the coordinator on every change.
+ * Router device with three HA endpoints:
+ *   1: Basic, Identify, Occupancy Sensing (0x0406) - occupied when the radar
+ *      sees a moving and/or stationary target
+ *   2: Binary Input "Radar online" - LD2410 data frames are being received
+ *      (FAULT status flag set when the radar stops sending data)
+ *   3: Analog Input "Target distance" in cm
+ * Zigbee2MQTT generates entities from these clusters automatically and uses
+ * the Binary/Analog Input description attribute as the entity name.
  */
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,13 +31,26 @@ static const char *TAG = "zb_presence";
 /* Zigbee network configuration: router, joins an existing network */
 #define MAX_CHILDREN                    10
 #define INSTALLCODE_POLICY_ENABLE       false
-#define SENSOR_ENDPOINT                 1
-#define HA_OCCUPANCY_SENSOR_DEVICE_ID   0x0107
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
+
+/* Endpoints */
+#define SENSOR_ENDPOINT                 1   /* Occupancy Sensing */
+#define RADAR_ONLINE_ENDPOINT           2   /* Binary Input: LD2410 is sending data */
+#define DISTANCE_ENDPOINT               3   /* Analog Input: target distance (cm) */
+#define HA_OCCUPANCY_SENSOR_DEVICE_ID   0x0107
+#define HA_SIMPLE_SENSOR_DEVICE_ID      0x000C
 
 /* ZCL character strings: first byte is the length */
 #define MANUFACTURER_NAME               "\x06""haxeko"
 #define MODEL_IDENTIFIER                "\x0E""ESP32H2-LD2410"
+#define RADAR_ONLINE_DESCRIPTION        "\x0C""Radar online"
+#define DISTANCE_DESCRIPTION            "\x0F""Target distance"
+
+#define BACNET_UNITS_CENTIMETERS        118
+#define STATUS_FLAG_FAULT               0x02
+#define RADAR_TIMEOUT_MS                3000    /* no frame for this long = radar offline */
+#define RADAR_MONITOR_PERIOD_MS         1000
+#define DISTANCE_REPORT_STEP_CM         10
 
 #define ESP_ZB_ZR_CONFIG()                                  \
     {                                                       \
@@ -47,13 +65,25 @@ static volatile bool s_zb_started;
 static volatile bool s_joined;
 static int s_occupied = -1; /* -1 = unknown, forces the first update */
 
-/* ---------- occupancy -> Zigbee ---------- */
+/* Latest radar data, written by the LD2410 task, read by the Zigbee task */
+static volatile TickType_t s_last_frame_tick;
+static volatile bool s_frame_received;
+static volatile uint16_t s_distance_cm;
 
-static void report_occupancy(uint8_t occupancy)
+/* ---------- attributes -> Zigbee (call with the Zigbee lock held / in Zigbee task) ---------- */
+
+/* Optional attribute: log instead of aborting if the stack does not support it */
+#define ADD_OPTIONAL_ATTR(fn, list, id, value)                                      \
+    do {                                                                            \
+        esp_err_t _e = fn(list, id, value);                                         \
+        if (_e != ESP_OK) {                                                         \
+            ESP_LOGW(TAG, #fn "(0x%04x) failed: %s", id, esp_err_to_name(_e));      \
+        }                                                                           \
+    } while (0)
+
+static void set_and_report(uint8_t endpoint, uint16_t cluster, uint16_t attr, void *value)
 {
-    esp_zb_zcl_set_attribute_val(SENSOR_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID, &occupancy, false);
+    esp_zb_zcl_set_attribute_val(endpoint, cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attr, value, false);
     if (!s_joined) {
         return;
     }
@@ -62,18 +92,68 @@ static void report_occupancy(uint8_t occupancy)
     esp_zb_zcl_report_attr_cmd_t cmd = { 0 };
     cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
     cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = SENSOR_ENDPOINT;
+    cmd.zcl_basic_cmd.src_endpoint = endpoint;
     cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING;
-    cmd.attributeID = ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID;
+    cmd.clusterID = cluster;
+    cmd.attributeID = attr;
     cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
     esp_zb_zcl_report_attr_cmd_req(&cmd);
+}
+
+static void report_occupancy(uint8_t occupancy)
+{
+    set_and_report(SENSOR_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING,
+                   ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID, &occupancy);
+}
+
+/* Runs every second in the Zigbee task: radar online state and target distance */
+static void radar_monitor_cb(uint8_t param)
+{
+    static int last_online = -1; /* -1 = unknown, forces the first update */
+    static int last_distance = -1;
+
+    bool online = s_frame_received &&
+                  (xTaskGetTickCount() - s_last_frame_tick) < pdMS_TO_TICKS(RADAR_TIMEOUT_MS);
+
+    if (online != last_online) {
+        last_online = online;
+        bool present = online;
+        uint8_t flags = online ? 0 : STATUS_FLAG_FAULT;
+        if (online) {
+            ESP_LOGI(TAG, "Radar ONLINE (LD2410 data frames received)");
+        } else {
+            ESP_LOGW(TAG, "Radar OFFLINE: no LD2410 data frame for %d ms - check wiring "
+                     "(LD2410 TX -> GPIO%d, RX -> GPIO%d), 5V supply and baud rate (%d)",
+                     RADAR_TIMEOUT_MS, CONFIG_LD2410_UART_RX_GPIO, CONFIG_LD2410_UART_TX_GPIO,
+                     CONFIG_LD2410_BAUD_RATE);
+        }
+        esp_zb_zcl_set_attribute_val(RADAR_ONLINE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                     ESP_ZB_ZCL_ATTR_BINARY_INPUT_STATUS_FLAG_ID, &flags, false);
+        set_and_report(RADAR_ONLINE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                       ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID, &present);
+    }
+
+    int distance = online ? s_distance_cm : 0;
+    if (last_distance < 0 || abs(distance - last_distance) >= DISTANCE_REPORT_STEP_CM ||
+        (distance == 0) != (last_distance == 0)) {
+        last_distance = distance;
+        float value = distance;
+        set_and_report(DISTANCE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                       ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &value);
+    }
+
+    esp_zb_scheduler_alarm(radar_monitor_cb, 0, RADAR_MONITOR_PERIOD_MS);
 }
 
 static void on_radar_report(const ld2410_report_t *r)
 {
     static TickType_t last_log;
     int occupied = r->state != LD2410_TARGET_NONE;
+
+    s_distance_cm = occupied ? r->detection_distance_cm : 0;
+    s_last_frame_tick = xTaskGetTickCount();
+    s_frame_received = true;
 
     if (xTaskGetTickCount() - last_log > pdMS_TO_TICKS(5000)) {
         last_log = xTaskGetTickCount();
@@ -232,6 +312,42 @@ static esp_zb_ep_list_t *sensor_ep_create(void)
         .app_device_version = 0,
     };
     ESP_ERROR_CHECK(esp_zb_ep_list_add_ep(ep_list, clusters, ep_cfg));
+
+    /* Endpoint 2: "Radar online" binary input (Zigbee2MQTT uses the description as name) */
+    esp_zb_binary_input_cluster_cfg_t online_cfg = {
+        .out_of_service = false,
+        .status_flags = STATUS_FLAG_FAULT,
+        .present_value = false,
+    };
+    esp_zb_attribute_list_t *online = esp_zb_binary_input_cluster_create(&online_cfg);
+    ADD_OPTIONAL_ATTR(esp_zb_binary_input_cluster_add_attr, online, ESP_ZB_ZCL_ATTR_BINARY_INPUT_DESCRIPTION_ID, RADAR_ONLINE_DESCRIPTION);
+    esp_zb_cluster_list_t *online_clusters = esp_zb_zcl_cluster_list_create();
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_binary_input_cluster(online_clusters, online,
+                                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    ep_cfg.endpoint = RADAR_ONLINE_ENDPOINT;
+    ep_cfg.app_device_id = HA_SIMPLE_SENSOR_DEVICE_ID;
+    ESP_ERROR_CHECK(esp_zb_ep_list_add_ep(ep_list, online_clusters, ep_cfg));
+
+    /* Endpoint 3: "Target distance" analog input in cm */
+    esp_zb_analog_input_cluster_cfg_t distance_cfg = {
+        .out_of_service = false,
+        .present_value = 0,
+        .status_flags = 0,
+    };
+    uint16_t units = BACNET_UNITS_CENTIMETERS;
+    float min_value = 0;
+    float max_value = 600; /* LD2410 max range: 8 gates x 0.75 m */
+    esp_zb_attribute_list_t *distance = esp_zb_analog_input_cluster_create(&distance_cfg);
+    ADD_OPTIONAL_ATTR(esp_zb_analog_input_cluster_add_attr, distance, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, DISTANCE_DESCRIPTION);
+    ADD_OPTIONAL_ATTR(esp_zb_analog_input_cluster_add_attr, distance, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_ENGINEERING_UNITS_ID, &units);
+    ADD_OPTIONAL_ATTR(esp_zb_analog_input_cluster_add_attr, distance, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_MIN_PRESENT_VALUE_ID, &min_value);
+    ADD_OPTIONAL_ATTR(esp_zb_analog_input_cluster_add_attr, distance, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_MAX_PRESENT_VALUE_ID, &max_value);
+    esp_zb_cluster_list_t *distance_clusters = esp_zb_zcl_cluster_list_create();
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(distance_clusters, distance,
+                                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    ep_cfg.endpoint = DISTANCE_ENDPOINT;
+    ESP_ERROR_CHECK(esp_zb_ep_list_add_ep(ep_list, distance_clusters, ep_cfg));
+
     return ep_list;
 }
 
@@ -245,6 +361,7 @@ static void esp_zb_task(void *pvParameters)
 
     ESP_ERROR_CHECK(esp_zb_start(false));
     s_zb_started = true;
+    esp_zb_scheduler_alarm(radar_monitor_cb, 0, RADAR_MONITOR_PERIOD_MS);
     esp_zb_stack_main_loop();
 }
 

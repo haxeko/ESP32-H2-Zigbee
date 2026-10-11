@@ -2,10 +2,22 @@
 
 Firmware **Zigbee 3.0** cho **ESP32-H2** + radar mmWave 24 GHz **HLK-LD2410** (LD2410 / LD2410B / LD2410C),
 viết bằng **ESP-IDF + esp-zigbee-sdk**. Thiết bị là **Zigbee Router**, khai báo kiểu
-**Occupancy Sensor (0x0107)**, gồm các cluster Basic, Identify và **Occupancy Sensing (0x0406)**.
+**Occupancy Sensor (0x0107)** với 3 endpoint:
+
+| Endpoint | Cluster | Entity Zigbee2MQTT / Home Assistant |
+|---|---|---|
+| 1 | Occupancy Sensing (0x0406) | `occupancy` – có người / không có người |
+| 2 | Binary Input (0x000F), description *Radar online* | `binary_input_2` – **Radar online**: LD2410 đang gửi dữ liệu |
+| 3 | Analog Input (0x000C), description *Target distance*, đơn vị cm | `analog_input_3` – **Target distance** (cm) |
+
+Zigbee2MQTT tự sinh entity cho thiết bị chưa có trong danh sách hỗ trợ ("Automatically generated definition")
+từ các cluster trên, và lấy thuộc tính `description` của Binary/Analog Input làm tên entity trong Home Assistant,
+nên **không cần external converter**.
 
 - Radar phát hiện người **đang di chuyển hoặc đứng yên** → `occupancy = 1`, không còn người → `0`.
 - Mỗi lần trạng thái đổi, thiết bị **tự gửi báo cáo** về coordinator, không cần cấu hình reporting.
+- **Radar online**: bật khi đang nhận được frame dữ liệu hợp lệ từ LD2410; quá 3 s không có frame nào
+  → tắt, đặt cờ FAULT và in cảnh báo trong log (kiểm tra dây TX/RX, nguồn 5 V, baud rate).
 - Dùng được với Zigbee2MQTT, ZHA (Home Assistant), deCONZ, SmartThings...
 
 ## Đấu dây
@@ -64,6 +76,7 @@ Log mẫu:
 I ld2410: UART1 @ 256000 baud, TX GPIO3 -> LD2410 RX, RX GPIO4 <- LD2410 TX
 I ld2410: Configured: max gate 8 (6.00 m), no-one duration 10 s
 I zb_presence: Joined network (PAN ID: 0x1a62, Channel: 11, Short Address: 0x3f21)
+I zb_presence: Radar ONLINE (LD2410 data frames received)
 I zb_presence: OCCUPIED (state 2, distance 135 cm)
 I zb_presence: state 2, moving 0 cm (0), stationary 135 cm (47), detect 135 cm
 ```
@@ -72,7 +85,11 @@ I zb_presence: state 2, moving 0 cm (0), stationary 135 cm (47), detect 135 cm
 
 1. Bật *Permit join* trên coordinator.
 2. Cấp nguồn: thiết bị mới tự động tìm và tham gia mạng, thử lại mỗi giây cho tới khi thành công.
-3. Coordinator nhận thiết bị `haxeko` / `ESP32H2-LD2410` với thuộc tính **occupancy**.
+3. Coordinator nhận thiết bị `haxeko` / `ESP32H2-LD2410` với các entity occupancy, Radar online, Target distance.
+
+> **Đã ghép bằng firmware cũ (chỉ có endpoint 1)?** Zigbee2MQTT chỉ đọc danh sách endpoint lúc phỏng vấn
+> (interview), nên phải: xoá thiết bị trong Z2M → giữ nút BOOT ≥ 5 s (hoặc `erase-flash` khi nạp) để
+> factory reset → *Permit join* và ghép lại. Sau khi ghép lại sẽ thấy đủ 3 entity.
 
 ## Cấu trúc
 
