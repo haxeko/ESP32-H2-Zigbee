@@ -35,8 +35,8 @@ ESP32-H2                 Module relay
 
 ## Build & nạp
 
-Yêu cầu ESP-IDF **v5.3** trở lên. Các thư viện Zigbee được Component Manager tự tải
-(xem `main/idf_component.yml`).
+Đã build thử với **ESP-IDF v5.3.2** (bản esp-zigbee-sdk khuyến nghị) + `esp-zigbee-lib`/`esp-zboss-lib` **1.6.4**
+(ghim trong `main/idf_component.yml`, Component Manager tự tải).
 
 ```bash
 . $IDF_PATH/export.sh
