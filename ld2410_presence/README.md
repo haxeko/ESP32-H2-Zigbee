@@ -18,6 +18,7 @@ nên **không cần external converter**.
 - Mỗi lần trạng thái đổi, thiết bị **tự gửi báo cáo** về coordinator, không cần cấu hình reporting.
 - **Radar online**: bật khi đang nhận được frame dữ liệu hợp lệ từ LD2410; quá 3 s không có frame nào
   → tắt, đặt cờ FAULT và in cảnh báo trong log (kiểm tra dây TX/RX, nguồn 5 V, baud rate).
+  Trạng thái này được gửi lại mỗi lần thiết bị vào mạng và định kỳ 60 s.
 - Dùng được với Zigbee2MQTT, ZHA (Home Assistant), deCONZ, SmartThings...
 
 ## Đấu dây

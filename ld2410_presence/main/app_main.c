@@ -51,6 +51,7 @@ static const char *TAG = "zb_presence";
 #define RADAR_TIMEOUT_MS                3000    /* no frame for this long = radar offline */
 #define RADAR_MONITOR_PERIOD_MS         1000
 #define DISTANCE_REPORT_STEP_CM         10
+#define RADAR_HEARTBEAT_PERIODS         60      /* re-report online/distance every 60 s */
 
 #define ESP_ZB_ZR_CONFIG()                                  \
     {                                                       \
@@ -63,7 +64,20 @@ static const char *TAG = "zb_presence";
 
 static volatile bool s_zb_started;
 static volatile bool s_joined;
-static int s_occupied = -1; /* -1 = unknown, forces the first update */
+/* Last values sent to the network; -1 = unknown, forces the next update.
+ * Reset on every network join: values that changed before the device joined
+ * (e.g. the radar coming online at boot) were never delivered. */
+static int s_occupied = -1;
+static int s_reported_online = -1;
+static int s_reported_distance = -1;
+
+static void resend_all_on_join(void)
+{
+    s_joined = true;
+    s_occupied = -1;
+    s_reported_online = -1;
+    s_reported_distance = -1;
+}
 
 /* Latest radar data, written by the LD2410 task, read by the Zigbee task */
 static volatile TickType_t s_last_frame_tick;
@@ -109,16 +123,21 @@ static void report_occupancy(uint8_t occupancy)
 /* Runs every second in the Zigbee task: radar online state and target distance */
 static void radar_monitor_cb(uint8_t param)
 {
-    static int last_online = -1; /* -1 = unknown, forces the first update */
-    static int last_distance = -1;
+    static int periods;
+    static int logged_online = -1;
 
     bool online = s_frame_received &&
                   (xTaskGetTickCount() - s_last_frame_tick) < pdMS_TO_TICKS(RADAR_TIMEOUT_MS);
 
-    if (online != last_online) {
-        last_online = online;
-        bool present = online;
-        uint8_t flags = online ? 0 : STATUS_FLAG_FAULT;
+    if (++periods >= RADAR_HEARTBEAT_PERIODS) {
+        /* Heartbeat: re-send even if unchanged, so a lost report is recovered */
+        periods = 0;
+        s_reported_online = -1;
+        s_reported_distance = -1;
+    }
+
+    if (online != logged_online) {
+        logged_online = online;
         if (online) {
             ESP_LOGI(TAG, "Radar ONLINE (LD2410 data frames received)");
         } else {
@@ -127,6 +146,12 @@ static void radar_monitor_cb(uint8_t param)
                      RADAR_TIMEOUT_MS, CONFIG_LD2410_UART_RX_GPIO, CONFIG_LD2410_UART_TX_GPIO,
                      CONFIG_LD2410_BAUD_RATE);
         }
+    }
+
+    if (online != s_reported_online) {
+        s_reported_online = online;
+        bool present = online;
+        uint8_t flags = online ? 0 : STATUS_FLAG_FAULT;
         esp_zb_zcl_set_attribute_val(RADAR_ONLINE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
                                      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                      ESP_ZB_ZCL_ATTR_BINARY_INPUT_STATUS_FLAG_ID, &flags, false);
@@ -135,9 +160,9 @@ static void radar_monitor_cb(uint8_t param)
     }
 
     int distance = online ? s_distance_cm : 0;
-    if (last_distance < 0 || abs(distance - last_distance) >= DISTANCE_REPORT_STEP_CM ||
-        (distance == 0) != (last_distance == 0)) {
-        last_distance = distance;
+    if (s_reported_distance < 0 || abs(distance - s_reported_distance) >= DISTANCE_REPORT_STEP_CM ||
+        (distance == 0) != (s_reported_distance == 0)) {
+        s_reported_distance = distance;
         float value = distance;
         set_and_report(DISTANCE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
                        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &value);
@@ -239,8 +264,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
                 ESP_LOGI(TAG, "Device rebooted, rejoined network");
-                s_joined = true;
-                s_occupied = -1; /* re-send current occupancy */
+                resend_all_on_join();
             }
         } else {
             ESP_LOGW(TAG, "%s failed with status: %s, retrying",
@@ -253,8 +277,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Joined network (PAN ID: 0x%04hx, Channel: %d, Short Address: 0x%04hx)",
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
-            s_joined = true;
-            s_occupied = -1; /* re-send current occupancy */
+            resend_all_on_join();
         } else {
             ESP_LOGI(TAG, "Network steering not successful (status: %s), retrying",
                      esp_err_to_name(err_status));
